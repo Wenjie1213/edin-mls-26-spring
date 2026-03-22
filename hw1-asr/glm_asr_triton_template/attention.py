@@ -63,7 +63,30 @@ def attention_scores_kernel(
     # Step 4: Store scores
 
     # YOUR CODE HERE
-    pass
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    q_ptrs = q_ptr + pid_bh * stride_q0 + pid_q * stride_q1 + offs_d * stride_q2
+    k_ptrs = (
+        k_ptr
+        + pid_bh * stride_k0
+        + offs_k[:, None] * stride_k1
+        + offs_d[None, :] * stride_k2
+    )
+    s_ptrs = scores_ptr + pid_bh * stride_s0 + pid_q * stride_s1 + offs_k * stride_s2
+
+    q = tl.load(q_ptrs, mask=offs_d < head_dim, other=0.0)
+    k = tl.load(
+        k_ptrs,
+        mask=(offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim),
+        other=0.0,
+    )
+
+    scores = tl.sum(k * q[None, :], axis=1)
+    scores = scores * scale
+
+    tl.store(s_ptrs, scores, mask=offs_k < seq_k)
+
 
 
 @triton.jit
@@ -79,12 +102,20 @@ def softmax_inplace_kernel(scores_ptr, stride_s, seq_k, BLOCK_SIZE: tl.constexpr
     # ============================================================================
     #
     # Step 1: Load scores row with masking
-    # Step 2: Subtract max for stability
-    # Step 3: Compute exp and normalize
-    # Step 4: Store back
+    row = tl.program_id(0)
 
-    # YOUR CODE HERE
-    pass
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < seq_k
+    ptrs = scores_ptr + row * stride_s + offs
+
+    logits = tl.load(ptrs, mask=mask, other=-float("inf"))
+    logits = logits - tl.max(logits, axis=0)
+
+    exp_logits = tl.exp(logits)
+    denom = tl.sum(exp_logits, axis=0)
+    probs = exp_logits / denom
+
+    tl.store(ptrs, probs, mask=mask)
 
 
 @triton.jit
