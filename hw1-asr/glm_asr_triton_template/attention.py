@@ -105,8 +105,7 @@ def softmax_inplace_kernel(scores_ptr, stride_s, seq_k, BLOCK_SIZE: tl.constexpr
     # Step 2: Subtract max for stability
     # Step 3: Compute exp and normalize
     # Step 4: Store back
-    row = tl.program_id(0)
-
+    
     offs = tl.arange(0, BLOCK_SIZE)
     mask = offs < seq_k
     ptrs = scores_ptr + row * stride_s + offs
