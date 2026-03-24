@@ -93,19 +93,29 @@ def layernorm_kernel(
     Grid: (batch_size,)
     """
     pid = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < hidden_size
 
-    # ============================================================================
-    # TODO: Implement LayerNorm kernel
-    # ============================================================================
-    #
     # Step 1: Load input, weight, and bias
-    # Step 2: Compute mean
-    # Step 3: Center the data
-    # Step 4: Compute variance = mean((x - mean)^2)
-    # Step 5: Normalize and apply affine transform
+    x = tl.load(x_ptr + pid * stride_x + offs, mask=mask, other=0.0)
+    x = x.to(tl.float32)
+    w = tl.load(w_ptr + offs, mask=mask, other=0.0)
+    b = tl.load(b_ptr + offs, mask=mask, other=0.0)
 
-    # YOUR CODE HERE
-    pass
+    # Step 2: Compute mean
+    mean = tl.sum(x, axis=0) / hidden_size
+
+    # Step 3: Center the data
+    x_centered = x - mean
+
+    # Step 4: Compute variance = mean((x - mean)^2)
+    var = tl.sum(x_centered * x_centered, axis=0) / hidden_size
+
+    # Step 5: Normalize and apply affine transform
+    x_norm = x_centered * tl.rsqrt(var + eps)
+    y = x_norm * w + b
+    tl.store(y_ptr + pid * stride_y + offs, y, mask=mask)
+
 
 
 @triton.jit
