@@ -126,7 +126,13 @@ def gelu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     # Step 3: Store output
 
     # YOUR CODE HERE
-    pass
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < n_elements
+    x = tl.load(x_ptr + offs, mask=mask, other = 0.0)
+    x3 = x*x*x
+    inner = 0.79788456 * (x + 0.044715 * x3)
+    y = 0.5 * x * (1 + tl.math.tanh(inner))
+    tl.store(y_ptr + offs, y, mask=mask)
 
 
 @triton.jit
@@ -147,7 +153,12 @@ def silu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     # Step 3: Multiply and store
 
     # YOUR CODE HERE
-    pass
+    offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs < n_elements
+    x = tl.load(x_ptr + offs, mask=mask, other = 0.0)
+    sigmoid = 1 / (1 + tl.exp(-x))
+    y = x * sigmoid
+    tl.store(y_ptr + offs, y, mask=mask)
 
 
 @triton.jit
@@ -188,7 +199,33 @@ def linear_kernel_tf32(
     # Step 3: Store the result
 
     # YOUR CODE HERE
-    pass
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    
+    for k_start in range(0, K, BLOCK_K):
+        offs_k = k_start + tl.arange(0, BLOCK_K)
+        
+        a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+        b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+        
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & (offs_k[None, :] < K),
+            other = 0.0,
+        )
+        
+        b = tl.load(
+            b_ptrs,
+            mask = (offs_k[:, None] < K) & (offs_n[None, :] < N),
+            other = 0.0,
+        )
+        
+        acc += tl.dot(a, b)
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=c_mask)
 
 
 @triton.jit
