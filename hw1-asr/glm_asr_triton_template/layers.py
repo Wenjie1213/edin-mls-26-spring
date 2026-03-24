@@ -390,18 +390,22 @@ def softmax_kernel(x_ptr, y_ptr, stride_x, stride_y, n_cols, BLOCK_SIZE: tl.cons
     *** TODO: Implement this kernel ***
     """
     row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < n_cols
 
-    # ============================================================================
-    # TODO: Implement softmax kernel
-    # ============================================================================
-    #
-    # Step 1: Load row with masking
-    # Step 2: Subtract max for stability
+    # Step 1: Load row with masking (use -inf for out-of-bounds to not affect max)
+    x = tl.load(x_ptr + row * stride_x + offs, mask=mask, other=-float("inf"))
+
+    # Step 2: Subtract max for numerical stability
+    x = x - tl.max(x, axis=0)
+
     # Step 3: Compute exp and normalize
-    # Step 4: Store output
+    exp_x = tl.exp(x)
+    denom = tl.sum(exp_x, axis=0)
+    y = exp_x / denom
 
-    # YOUR CODE HERE
-    pass
+    # Step 4: Store output
+    tl.store(y_ptr + row * stride_y + offs, y, mask=mask)
 
 
 @triton.jit
