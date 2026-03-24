@@ -42,6 +42,7 @@ def next_power_of_two(x: int) -> int:
 
 @triton.jit
 def rmsnorm_kernel(
+def rmsnorm_kernel(
     x_ptr,
     w_ptr,
     y_ptr,
@@ -59,18 +60,23 @@ def rmsnorm_kernel(
     Grid: (batch_size,)
     """
     pid = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < hidden_size
 
-    # ============================================================================
-    # TODO: Implement RMSNorm kernel
-    # ============================================================================
-    #
     # Step 1: Load input row and weight
-    # Step 2: Compute variance = mean(x^2)
-    # Step 3: Normalize: x / sqrt(variance + eps)
-    # Step 4: Apply weight and store
+    x = tl.load(x_ptr + pid * stride_x + offs, mask=mask, other=0.0)
+    x = x.to(tl.float32)
+    w = tl.load(w_ptr + offs, mask=mask, other=0.0)
 
-    # YOUR CODE HERE
-    pass
+    # Step 2: Compute variance = mean(x^2)
+    var = tl.sum(x * x, axis=0) / hidden_size
+
+    # Step 3: Normalize: x / sqrt(variance + eps)
+    x_norm = x * tl.rsqrt(var + eps)
+
+    # Step 4: Apply weight and store
+    y = x_norm * w
+    tl.store(y_ptr + pid * stride_y + offs, y, mask=mask)
 
 
 @triton.jit
