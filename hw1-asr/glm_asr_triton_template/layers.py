@@ -394,7 +394,8 @@ def softmax_kernel(x_ptr, y_ptr, stride_x, stride_y, n_cols, BLOCK_SIZE: tl.cons
     mask = offs < n_cols
 
     # Step 1: Load row with masking (use -inf for out-of-bounds to not affect max)
-    x = tl.load(x_ptr + row * stride_x + offs, mask=mask, other=-float("inf"))
+    x = tl.load(x_ptr + row * stride_x + offs, mask=mask, other=-float("inf")).to(tl.float32)
+    
 
     # Step 2: Subtract max for numerical stability
     x = x - tl.max(x, axis=0)
