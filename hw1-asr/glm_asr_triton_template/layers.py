@@ -42,7 +42,6 @@ def next_power_of_two(x: int) -> int:
 
 @triton.jit
 def rmsnorm_kernel(
-def rmsnorm_kernel(
     x_ptr,
     w_ptr,
     y_ptr,
