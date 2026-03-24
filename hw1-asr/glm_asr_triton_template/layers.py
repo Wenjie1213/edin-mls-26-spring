@@ -111,7 +111,7 @@ def layernorm_kernel(
     mean = tl.sum(x, axis=0) / hidden_size
 
     # Step 3: Center the data
-    x_centered = x - mean
+    x_centered = tl.where(mask, x - mean, 0.0)
 
     # Step 4: Compute variance = mean((x - mean)^2)
     var = tl.sum(x_centered * x_centered, axis=0) / hidden_size
