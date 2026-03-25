@@ -43,24 +43,50 @@ def compute_freqs_kernel(
     """
     Compute cos and sin for rotary embeddings.
 
-    *** TODO: Implement this kernel ***
-
     Grid: (seq_len,)
     """
     pid = tl.program_id(0)
 
-    # ============================================================================
-    # TODO: Implement frequency computation
-    # ============================================================================
-    #
-    # Step 1: Load position as scalar
-    # Step 2: Load inverse frequencies
-    # Step 3: Compute freqs = position * inv_freq
-    # Step 4: Compute cos and sin
-    # Step 5: Store concatenated cos/sin
+    offs = tl.arange(0, BLOCK)
+    mask = offs < half_dim
 
-    # YOUR CODE HERE
-    pass
+    # position scalar for this row
+    pos = tl.load(positions_ptr + pid * stride_pos)
+
+    # load inverse frequencies
+    inv_freq = tl.load(inv_freq_ptr + offs * stride_inv, mask=mask, other=0.0)
+
+    # freqs = position * inv_freq
+    freqs = pos * inv_freq
+
+    # compute cos / sin
+    cos_vals = tl.cos(freqs)
+    sin_vals = tl.sin(freqs)
+
+    # store duplicated halves:
+    # [cos_half, cos_half], [sin_half, sin_half]
+    tl.store(
+        cos_ptr + pid * stride_cos0 + offs * stride_cos1,
+        cos_vals,
+        mask=mask,
+    )
+    tl.store(
+        cos_ptr + pid * stride_cos0 + (offs + half_dim) * stride_cos1,
+        cos_vals,
+        mask=mask,
+    )
+
+    tl.store(
+        sin_ptr + pid * stride_sin0 + offs * stride_sin1,
+        sin_vals,
+        mask=mask,
+    )
+    tl.store(
+        sin_ptr + pid * stride_sin0 + (offs + half_dim) * stride_sin1,
+        sin_vals,
+        mask=mask,
+    )
+
 
 
 # ============================================================================
