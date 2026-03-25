@@ -146,17 +146,45 @@ def attention_output_kernel(
     pid_bh = tl.program_id(0)
     pid_q = tl.program_id(1)
 
-    # ============================================================================
-    # TODO: Implement attention output computation
-    # ============================================================================
-    #
-    # Step 1: Load attention weights for this query
-    # Step 2: Load all values for this batch_head
-    # Step 3: Compute weighted sum
-    # Step 4: Store output
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_d = tl.arange(0, BLOCK_D)
 
-    # YOUR CODE HERE
-    pass
+    k_mask = offs_k < seq_k
+    d_mask = offs_d < head_dim
+
+    # Load attention weights for this (batch_head, query): shape [BLOCK_K]
+    attn = tl.load(
+        attn_ptr
+        + pid_bh * stride_w0
+        + pid_q * stride_w1
+        + offs_k * stride_w2,
+        mask=k_mask,
+        other=0.0,
+    )  # [K]
+
+    # Load values for this batch_head: shape [BLOCK_K, BLOCK_D]
+    v = tl.load(
+        v_ptr
+        + pid_bh * stride_v0
+        + offs_k[:, None] * stride_v1
+        + offs_d[None, :] * stride_v2,
+        mask=k_mask[:, None] & d_mask[None, :],
+        other=0.0,
+    )  # [K, D]
+
+    # Weighted sum over K
+    out = tl.sum(attn[:, None] * v, axis=0)  # [D]
+
+    # Store output for this (batch_head, query)
+    tl.store(
+        output_ptr
+        + pid_bh * stride_o0
+        + pid_q * stride_o1
+        + offs_d * stride_o2,
+        out,
+        mask=d_mask,
+)
+
 
 
 @triton.jit
