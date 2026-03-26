@@ -146,7 +146,7 @@ def gelu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     x = tl.load(x_ptr + offs, mask=mask, other = 0.0)
     x3 = x*x*x
     inner = 0.79788456 * (x + 0.044715 * x3)
-    y = 0.5 * x * (1 + tl.math.tanh(inner))
+    y = 0.5 * x * (1 + tl.extra.cuda.libdevice.tanh(inner))
     tl.store(y_ptr + offs, y, mask=mask)
 
 
