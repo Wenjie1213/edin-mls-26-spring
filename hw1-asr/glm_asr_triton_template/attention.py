@@ -119,6 +119,82 @@ def softmax_inplace_kernel(scores_ptr, stride_s, seq_k, BLOCK_SIZE: tl.constexpr
 
     tl.store(ptrs, probs, mask=mask)
 
+#Add New
+@triton.jit
+def attention_scores_softmax_fused_kernel(
+    q_ptr,
+    k_ptr,
+    probs_ptr,
+    scale,
+    seq_k,
+    head_dim,
+    offset,
+    is_causal,
+    stride_q0,
+    stride_q1,
+    stride_q2,
+    stride_k0,
+    stride_k1,
+    stride_k2,
+    stride_p0,
+    stride_p1,
+    stride_p2,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """
+    Fused attention score computation + causal mask + softmax.
+    Grid: (batch_heads, seq_q)
+    """
+    pid_bh = tl.program_id(0)
+    pid_q = tl.program_id(1)
+
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_d = tl.arange(0, BLOCK_D)
+
+    # load q: [D]
+    q = tl.load(
+        q_ptr + pid_bh * stride_q0 + pid_q * stride_q1 + offs_d * stride_q2,
+        mask=offs_d < head_dim,
+        other=0.0,
+    )
+
+    # load k: [K, D]
+    k = tl.load(
+        k_ptr
+        + pid_bh * stride_k0
+        + offs_k[:, None] * stride_k1
+        + offs_d[None, :] * stride_k2,
+        mask=(offs_k[:, None] < seq_k) & (offs_d[None, :] < head_dim),
+        other=0.0,
+    )
+
+    # compute scores
+    scores = tl.sum(k * q[None, :], axis=1) * scale
+
+    # invalidate padded positions
+    scores = tl.where(offs_k < seq_k, scores, -1e9)
+
+    # causal mask
+    if is_causal:
+        current_pos = pid_q + offset
+        scores = tl.where(offs_k > current_pos, -1e9, scores)
+
+    # softmax
+    row_max = tl.max(scores, axis=0)
+    exp_scores = tl.exp(scores - row_max)
+    row_sum = tl.sum(exp_scores, axis=0)
+    probs = exp_scores / row_sum
+
+    # store normalized probabilities
+    tl.store(
+        probs_ptr
+        + pid_bh * stride_p0
+        + pid_q * stride_p1
+        + offs_k * stride_p2,
+        probs,
+        mask=offs_k < seq_k,
+    )
 
 @triton.jit
 def attention_output_kernel(
@@ -296,7 +372,7 @@ def next_power_of_two(x: int) -> int:
 
 MAX_ATTENTION_DIM = 256
 
-
+FUSE_SCORE_SOFTMAX = True
 def scaled_dot_product_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -357,60 +433,142 @@ def scaled_dot_product_attention(
             dtype=torch.float32,
             device=q.device,
         )
-
         grid = (batch * num_heads, seq_q)
-        attention_scores_kernel[grid](
-            q_flat,
-            k_flat,
-            scores,
-            float(scale),
-            seq_k_padded,
-            head_dim_padded,
-            q_flat.stride(0),
-            q_flat.stride(1),
-            q_flat.stride(2),
-            k_flat.stride(0),
-            k_flat.stride(1),
-            k_flat.stride(2),
-            scores.stride(0),
-            scores.stride(1),
-            scores.stride(2),
-            BLOCK_K=seq_k_padded,
-            BLOCK_D=head_dim_padded,
+
+        can_fuse = (
+            FUSE_SCORE_SOFTMAX
+            and attention_mask is None
+            and seq_k_padded <= MAX_ATTENTION_DIM
         )
 
-        if seq_k_padded != seq_k:
-            scores[:, :, seq_k:] = -1e9
+        if can_fuse:
+            attention_scores_softmax_fused_kernel[grid](
+                q_flat,
+                k_flat,
+                scores,
+                float(scale),
+                seq_k_padded,
+                head_dim_padded,
+                0,  # offset
+                is_causal,
+                q_flat.stride(0),
+                q_flat.stride(1),
+                q_flat.stride(2),
+                k_flat.stride(0),
+                k_flat.stride(1),
+                k_flat.stride(2),
+                scores.stride(0),
+                scores.stride(1),
+                scores.stride(2),
+                BLOCK_K=seq_k_padded,
+                BLOCK_D=head_dim_padded,
+            )
+        else:
+            attention_scores_kernel[grid](
+                q_flat,
+                k_flat,
+                scores,
+                float(scale),
+                seq_k_padded,
+                head_dim_padded,
+                q_flat.stride(0),
+                q_flat.stride(1),
+                q_flat.stride(2),
+                k_flat.stride(0),
+                k_flat.stride(1),
+                k_flat.stride(2),
+                scores.stride(0),
+                scores.stride(1),
+                scores.stride(2),
+                BLOCK_K=seq_k_padded,
+                BLOCK_D=head_dim_padded,
+            )
 
-        if is_causal:
-            mask = torch.triu(
-                torch.ones((seq_q, seq_k_padded), dtype=torch.float32, device=q.device),
-                diagonal=1,
-            ) * -1e9
-            scores = scores + mask[None, :, :]
-
-        if attention_mask is not None:
-            if attention_mask.ndim == 4:
-                attention_mask = attention_mask.reshape(
-                    batch * num_heads, seq_q, seq_k
-                )
             if seq_k_padded != seq_k:
-                mask_padded = torch.zeros(
-                    (batch * num_heads, seq_q, seq_k_padded),
-                    dtype=torch.float32,
-                    device=q.device,
-                )
-                mask_padded[:, :, :seq_k] = attention_mask
-                mask_padded[:, :, seq_k:] = -1e9
-                attention_mask = mask_padded
-            scores = scores + attention_mask
+                scores[:, :, seq_k:] = -1e9
 
-        scores_2d = scores.reshape(batch * num_heads * seq_q, seq_k_padded)
-        block = seq_k_padded
-        softmax_inplace_kernel[(scores_2d.shape[0],)](
-            scores_2d, scores_2d.stride(0), seq_k_padded, BLOCK_SIZE=block
-        )
-        scores = scores_2d.reshape(batch * num_heads, seq_q, seq_k_padded)
+            if is_causal:
+                mask = torch.triu(
+                    torch.ones((seq_q, seq_k_padded), dtype=torch.float32, device=q.device),
+                    diagonal=1,
+                ) * -1e9
+                scores = scores + mask[None, :, :]
+
+            if attention_mask is not None:
+                if attention_mask.ndim == 4:
+                    attention_mask = attention_mask.reshape(
+                        batch * num_heads, seq_q, seq_k
+                    )
+                if seq_k_padded != seq_k:
+                    mask_padded = torch.zeros(
+                        (batch * num_heads, seq_q, seq_k_padded),
+                        dtype=torch.float32,
+                        device=q.device,
+                    )
+                    mask_padded[:, :, :seq_k] = attention_mask
+                    mask_padded[:, :, seq_k:] = -1e9
+                    attention_mask = mask_padded
+                scores = scores + attention_mask
+
+            scores_2d = scores.reshape(batch * num_heads * seq_q, seq_k_padded)
+            block = seq_k_padded
+            softmax_inplace_kernel[(scores_2d.shape[0],)](
+                scores_2d, scores_2d.stride(0), seq_k_padded, BLOCK_SIZE=block
+            )
+            scores = scores_2d.reshape(batch * num_heads, seq_q, seq_k_padded)
+        # grid = (batch * num_heads, seq_q)
+        # attention_scores_kernel[grid](
+        #     q_flat,
+        #     k_flat,
+        #     scores,
+        #     float(scale),
+        #     seq_k_padded,
+        #     head_dim_padded,
+        #     q_flat.stride(0),
+        #     q_flat.stride(1),
+        #     q_flat.stride(2),
+        #     k_flat.stride(0),
+        #     k_flat.stride(1),
+        #     k_flat.stride(2),
+        #     scores.stride(0),
+        #     scores.stride(1),
+        #     scores.stride(2),
+        #     BLOCK_K=seq_k_padded,
+        #     BLOCK_D=head_dim_padded,
+        # )
+
+        # if seq_k_padded != seq_k:
+        #     scores[:, :, seq_k:] = -1e9
+
+        # if is_causal:
+        #     mask = torch.triu(
+        #         torch.ones((seq_q, seq_k_padded), dtype=torch.float32, device=q.device),
+        #         diagonal=1,
+        #     ) * -1e9
+        #     scores = scores + mask[None, :, :]
+
+        # if attention_mask is not None:
+        #     if attention_mask.ndim == 4:
+        #         attention_mask = attention_mask.reshape(
+        #             batch * num_heads, seq_q, seq_k
+        #         )
+        #     if seq_k_padded != seq_k:
+        #         mask_padded = torch.zeros(
+        #             (batch * num_heads, seq_q, seq_k_padded),
+        #             dtype=torch.float32,
+        #             device=q.device,
+        #         )
+        #         mask_padded[:, :, :seq_k] = attention_mask
+        #         mask_padded[:, :, seq_k:] = -1e9
+        #         attention_mask = mask_padded
+        #     scores = scores + attention_mask
+
+        # scores_2d = scores.reshape(batch * num_heads * seq_q, seq_k_padded)
+        # block = seq_k_padded
+        # softmax_inplace_kernel[(scores_2d.shape[0],)](
+        #     scores_2d, scores_2d.stride(0), seq_k_padded, BLOCK_SIZE=block
+        # )
+        # scores = scores_2d.reshape(batch * num_heads, seq_q, seq_k_padded)
 
         attention_output_kernel[grid](
             scores,

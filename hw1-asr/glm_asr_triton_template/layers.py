@@ -241,8 +241,61 @@ def linear_kernel_tf32(
     c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
     c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
     tl.store(c_ptrs, acc, mask=c_mask)
+#New Add
+@triton.jit
+def linear_bias_kernel_tf32(
+    a_ptr,
+    b_ptr,
+    bias_ptr,
+    c_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
 
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k_start in range(0, K, BLOCK_K):
+        offs_k = k_start + tl.arange(0, BLOCK_K)
+
+        a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+        b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+
+        a = tl.load(
+            a_ptrs,
+            mask=(offs_m[:, None] < M) & (offs_k[None, :] < K),
+            other=0.0,
+        )
+        b = tl.load(
+            b_ptrs,
+            mask=(offs_k[:, None] < K) & (offs_n[None, :] < N),
+            other=0.0,
+        )
+
+        acc += tl.dot(a, b)
+
+    # fused bias add
+    bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0)
+    acc += bias[None, :]
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptrs, acc, mask=c_mask)
+#
 @triton.jit
 def linear_gelu_kernel(
     a_ptr,
@@ -698,6 +751,7 @@ class Linear:
     TILE_N = 64
     TILE_K = 32
 
+    FUSE_BIAS = True
     BACKEND = "torch"
 
     def __init__(self, in_features: int, out_features: int, bias: bool = True):
@@ -761,8 +815,72 @@ class Linear:
 
         return output.reshape(*batch_dims, self.out_features)
 
+    # def _forward_triton(self, x: torch.Tensor) -> torch.Tensor:
+    #     """Triton matmul backend."""
+    #     original_shape = x.shape
+    #     batch_dims = original_shape[:-1]
+
+    #     M = int(np.prod(batch_dims))
+    #     K = self.in_features
+    #     N = self.out_features
+
+    #     x_2d = x.reshape(M, K).to(torch.float32).contiguous()
+
+    #     if self.weight.device != x.device:
+    #         self.weight = self.weight.to(x.device)
+    #         self._weight_t_padded = None
+    #     self._ensure_weight_prepared()
+
+    #     M_padded = pad_to_multiple(M, self.TILE_M)
+
+    #     if M_padded > M or self._K_padded > K:
+    #         x_padded = torch.zeros(
+    #             (M_padded, self._K_padded),
+    #             dtype=torch.float32,
+    #             device=x.device,
+    #         )
+    #         x_padded[:M, :K] = x_2d
+    #     else:
+    #         x_padded = x_2d
+
+    #     output = torch.zeros(
+    #         (M_padded, self._N_padded), dtype=torch.float32, device=x.device
+    #     )
+
+    #     grid = (
+    #         triton.cdiv(M_padded, self.TILE_M),
+    #         triton.cdiv(self._N_padded, self.TILE_N),
+    #     )
+    #     linear_kernel_tf32[grid](
+    #         x_padded,
+    #         self._weight_t_padded,
+    #         output,
+    #         M_padded,
+    #         self._N_padded,
+    #         self._K_padded,
+    #         x_padded.stride(0),
+    #         x_padded.stride(1),
+    #         self._weight_t_padded.stride(0),
+    #         self._weight_t_padded.stride(1),
+    #         output.stride(0),
+    #         output.stride(1),
+    #         BLOCK_M=self.TILE_M,
+    #         BLOCK_N=self.TILE_N,
+    #         BLOCK_K=self.TILE_K,
+    #         # num_warps=4,
+    #         # num_stages=3,
+    #     )
+
+    #     output = output[:M, :N]
+
+    #     if self.has_bias and self.bias_param is not None:
+    #         if self.bias_param.device != x.device:
+    #             self.bias_param = self.bias_param.to(x.device)
+    #         output = output + self.bias_param
+
+    #     return output.reshape(*batch_dims, self.out_features)
+
     def _forward_triton(self, x: torch.Tensor) -> torch.Tensor:
-        """Triton matmul backend."""
         original_shape = x.shape
         batch_dims = original_shape[:-1]
 
@@ -776,6 +894,9 @@ class Linear:
             self.weight = self.weight.to(x.device)
             self._weight_t_padded = None
         self._ensure_weight_prepared()
+
+        if self.has_bias and self.bias_param is not None and self.bias_param.device != x.device:
+            self.bias_param = self.bias_param.to(x.device)
 
         M_padded = pad_to_multiple(M, self.TILE_M)
 
@@ -797,33 +918,54 @@ class Linear:
             triton.cdiv(M_padded, self.TILE_M),
             triton.cdiv(self._N_padded, self.TILE_N),
         )
-        linear_kernel_tf32[grid](
-            x_padded,
-            self._weight_t_padded,
-            output,
-            M_padded,
-            self._N_padded,
-            self._K_padded,
-            x_padded.stride(0),
-            x_padded.stride(1),
-            self._weight_t_padded.stride(0),
-            self._weight_t_padded.stride(1),
-            output.stride(0),
-            output.stride(1),
-            BLOCK_M=self.TILE_M,
-            BLOCK_N=self.TILE_N,
-            BLOCK_K=self.TILE_K,
-        )
+
+        if self.has_bias and self.bias_param is not None and Linear.FUSE_BIAS:
+            bias_padded = torch.zeros(self._N_padded, dtype=torch.float32, device=x.device)
+            bias_padded[:N] = self.bias_param
+
+            linear_bias_kernel_tf32[grid](
+                x_padded,
+                self._weight_t_padded,
+                bias_padded,
+                output,
+                M_padded,
+                self._N_padded,
+                self._K_padded,
+                x_padded.stride(0),
+                x_padded.stride(1),
+                self._weight_t_padded.stride(0),
+                self._weight_t_padded.stride(1),
+                output.stride(0),
+                output.stride(1),
+                BLOCK_M=self.TILE_M,
+                BLOCK_N=self.TILE_N,
+                BLOCK_K=self.TILE_K,
+            )
+        else:
+            linear_kernel_tf32[grid](
+                x_padded,
+                self._weight_t_padded,
+                output,
+                M_padded,
+                self._N_padded,
+                self._K_padded,
+                x_padded.stride(0),
+                x_padded.stride(1),
+                self._weight_t_padded.stride(0),
+                self._weight_t_padded.stride(1),
+                output.stride(0),
+                output.stride(1),
+                BLOCK_M=self.TILE_M,
+                BLOCK_N=self.TILE_N,
+                BLOCK_K=self.TILE_K,
+            )
 
         output = output[:M, :N]
 
-        if self.has_bias and self.bias_param is not None:
-            if self.bias_param.device != x.device:
-                self.bias_param = self.bias_param.to(x.device)
+        if self.has_bias and self.bias_param is not None and not Linear.FUSE_BIAS:
             output = output + self.bias_param
 
         return output.reshape(*batch_dims, self.out_features)
-
 
 class Embedding:
     """Embedding layer using Triton."""
