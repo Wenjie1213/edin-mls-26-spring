@@ -940,6 +940,8 @@ class Linear:
                 BLOCK_M=self.TILE_M,
                 BLOCK_N=self.TILE_N,
                 BLOCK_K=self.TILE_K,
+                num_warps=2,
+                num_stages=3,
             )
         else:
             linear_kernel_tf32[grid](
@@ -958,6 +960,8 @@ class Linear:
                 BLOCK_M=self.TILE_M,
                 BLOCK_N=self.TILE_N,
                 BLOCK_K=self.TILE_K,
+                num_warps=2,
+                num_stages=3,
             )
 
         output = output[:M, :N]
