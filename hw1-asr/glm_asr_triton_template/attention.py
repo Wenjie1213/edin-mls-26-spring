@@ -433,6 +433,8 @@ def scaled_dot_product_attention(
             dtype=torch.float32,
             device=q.device,
         )
+        
+#------Code Modification-----#
         grid = (batch * num_heads, seq_q)
 
         can_fuse = (
@@ -516,6 +518,8 @@ def scaled_dot_product_attention(
                 scores_2d, scores_2d.stride(0), seq_k_padded, BLOCK_SIZE=block
             )
             scores = scores_2d.reshape(batch * num_heads, seq_q, seq_k_padded)
+
+#------Original Code------#
         # grid = (batch * num_heads, seq_q)
         # attention_scores_kernel[grid](
         #     q_flat,
@@ -569,7 +573,7 @@ def scaled_dot_product_attention(
         #     scores_2d, scores_2d.stride(0), seq_k_padded, BLOCK_SIZE=block
         # )
         # scores = scores_2d.reshape(batch * num_heads, seq_q, seq_k_padded)
-
+    
         attention_output_kernel[grid](
             scores,
             v_flat,

@@ -706,7 +706,7 @@ def gelu(x: torch.Tensor) -> torch.Tensor:
     """GELU activation using Triton."""
     original_shape = x.shape
     total = int(np.prod(x.shape))
-    block = 1024
+    block = 512
 
     x_flat = x.reshape(-1).contiguous().to(torch.float32)
     output = torch.empty_like(x_flat)
@@ -815,6 +815,7 @@ class Linear:
 
         return output.reshape(*batch_dims, self.out_features)
 
+#------Original Code------#
     # def _forward_triton(self, x: torch.Tensor) -> torch.Tensor:
     #     """Triton matmul backend."""
     #     original_shape = x.shape
@@ -880,6 +881,7 @@ class Linear:
 
     #     return output.reshape(*batch_dims, self.out_features)
 
+#-----Code Modification----#
     def _forward_triton(self, x: torch.Tensor) -> torch.Tensor:
         original_shape = x.shape
         batch_dims = original_shape[:-1]
